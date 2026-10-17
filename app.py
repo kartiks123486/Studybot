@@ -89,7 +89,7 @@ def chat():
     }).encode()
 
     req = urllib.request.Request(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent",
+        https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent
         data=data,
         headers={
             "Content-Type": "application/json",
