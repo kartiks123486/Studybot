@@ -134,7 +134,9 @@ def chat():
                 detail = e.read().decode(errors="replace")
                 print("Gemini API error:", e.code, detail)
                 last_code = e.code
-                if e.code not in (408, 429, 500, 502, 503, 504):
+                if e.code == 429:
+                    return jsonify(reply="Gemini API ki request limit abhi poori hai. Quota reset hone par dobara try karo."), 429
+                if e.code not in (408, 500, 502, 503, 504):
                     return jsonify(reply=f"Gemini API error ({e.code}). Termux logs check karo."), 502
             except Exception as e:
                 print("Connection error:", repr(e))
