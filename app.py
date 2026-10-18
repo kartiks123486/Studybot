@@ -10,6 +10,8 @@ app = Flask(__name__)
 HTML = r'''<!DOCTYPE html>
 <html lang="en">
 <head>
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#0b1020">
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#080b16">
@@ -54,12 +56,53 @@ $('chatForm').addEventListener('submit',e=>{e.preventDefault();sendMessage(promp
 if(chats.length){activeId=chats.slice().sort((a,b)=>(b.updated||0)-(a.updated||0))[0].id;}else{const c={id:Date.now().toString(),title:'New conversation',messages:[],updated:Date.now()};chats.push(c);activeId=c.id;save();}renderHistory();renderChat();
 })();
 </script>
-</body>
+
+<script>
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/static/sw.js")
+      .catch(err => console.error("Service worker error:", err));
+  });
+}
+</script>
+\n</body>
 </html>'''
 
 @app.route("/")
 def home():
     return render_template_string(HTML)
+
+
+
+
+@app.route("/manifest.json")
+def manifest():
+    return {
+        "id": "/",
+        "name": "StudyBot AI",
+        "short_name": "StudyBot",
+        "description": "Your smart AI study assistant.",
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "background_color": "#0b1020",
+        "theme_color": "#0b1020",
+        "icons": [
+            {
+                "src": "/static/icon-192.png",
+                "sizes": "192x192",
+                "type": "image/png",
+                "purpose": "any"
+            },
+            {
+                "src": "/static/icon-512.png",
+                "sizes": "512x512",
+                "type": "image/png",
+                "purpose": "any maskable"
+            }
+        ]
+    }
+
 
 @app.route("/chat", methods=["POST"])
 def chat():
