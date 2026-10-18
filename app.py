@@ -102,15 +102,38 @@ def chat():
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=45) as response:
-            result = json.loads(response.read().decode())
-        reply = result["candidates"][0]["content"]["parts"][0]["text"]
-        return jsonify(reply=reply)
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode(errors="replace")
-        print("Gemini API error:", detail)
-        return jsonify(reply="Gemini API error. Termux ki screen par error details check karo."), 502
-    except Exception as e:
+        
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(req, timeout=50) as response:
+                result = json.loads(response.read().decode())
+
+            reply = result["candidates"][0]["content"]["parts"][0]["text"]
+            return jsonify(reply=reply)
+
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")
+            print("Gemini API error:", e.code, detail)
+
+            if e.code in (429, 500, 502, 503, 504) and attempt == 0:
+                time.sleep(2)
+                continue
+
+            return jsonify(
+                reply=f"Gemini API error ({e.code}). Render Logs check karo."
+            ), 502
+
+        except Exception as e:
+            print("Connection error:", repr(e))
+
+            if attempt == 0:
+                time.sleep(2)
+                continue
+
+            return jsonify(
+                reply="AI server abhi jawab nahi de pa raha. Thodi der baad try karo."
+            ), 502
+
         print("Error:", str(e))
         return jsonify(reply="Connection mein problem hai. Internet check karo."), 500
 
