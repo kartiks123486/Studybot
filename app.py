@@ -1,6 +1,7 @@
 import os
 import json
 import time
+from datetime import datetime, timedelta, timezone
 import urllib.request
 import urllib.error
 from flask import Flask, request, jsonify, render_template_string
@@ -33,7 +34,7 @@ HTML = r'''<!DOCTYPE html>
 <main class="main">
 <header class="topbar"><button class="menu-btn" id="menuBtn" aria-label="Open history">☰</button><div class="logo" style="width:38px;height:38px;font-size:20px">🤖</div><div><div class="top-title">StudyBot <span class="gradient">AI</span></div><div class="top-subtitle">Your personal AI assistant</div></div><div class="top-status"><span class="online-dot"></span>Ready</div></header>
 <section class="chat-area" id="chatArea" aria-live="polite"></section>
-<div class="composer-wrap"><form class="composer" id="chatForm"><textarea id="prompt" rows="1" maxlength="10000" placeholder="Ask StudyBot anything..." aria-label="Your message"></textarea><button class="send-btn" id="sendBtn" type="submit" aria-label="Send message">↑</button></form><div class="disclaimer">StudyBot can make mistakes. Verify important information.</div></div>
+<div class="composer-wrap"><form class="composer" id="chatForm"><textarea id="prompt" rows="1" maxlength="10000" placeholder="Ask StudyBot anything..." aria-label="Your message"></textarea><button type="button" id="voiceBtn" aria-label="Start voice chat" style="height:44px;padding:0 13px;border:1px solid #42e8ff66;border-radius:13px;background:#17243b;color:#fff;font-size:14px;white-space:nowrap">🎙️ Voice</button><button class="send-btn" id="sendBtn" type="submit" aria-label="Send message">↑</button></form><div id="voiceStatus" class="disclaimer">Voice chat: off</div><div class="disclaimer">StudyBot can make mistakes. Verify important information.</div></div>
 </main></div>
 <script>
 (() => {
@@ -54,6 +55,143 @@ async function sendMessage(text){if(busy||!text.trim())return;if(!currentChat())
 try{const r=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message})});let d;try{d=await r.json();}catch(e){throw new Error('Server se valid response nahi mila.');}const reply=d.reply||d.error||'Jawab nahi mila.';bubble.textContent=reply;persistMessage('assistant',reply);if(!r.ok&&!d.reply)bubble.textContent='Server error ('+r.status+'). Thodi der baad try karo.';}catch(e){const err='Connection error. Internet aur AI server check karke dobara try karo.';bubble.textContent=err;persistMessage('assistant',err);}finally{busy=false;sendBtn.disabled=false;prompt.focus();chatArea.scrollTop=chatArea.scrollHeight;}}
 $('chatForm').addEventListener('submit',e=>{e.preventDefault();sendMessage(prompt.value);});prompt.addEventListener('input',autoSize);prompt.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('chatForm').requestSubmit();}});$('newChat').addEventListener('click',makeChat);$('menuBtn').addEventListener('click',()=>sidebar.classList.toggle('open'));
 if(chats.length){activeId=chats.slice().sort((a,b)=>(b.updated||0)-(a.updated||0))[0].id;}else{const c={id:Date.now().toString(),title:'New conversation',messages:[],updated:Date.now()};chats.push(c);activeId=c.id;save();}renderHistory();renderChat();
+
+const voiceBtn=$('voiceBtn'),voiceStatus=$('voiceStatus');
+let voiceWs=null,voiceStream=null,voiceCtx=null,voiceProcessor=null,voiceReady=false,playAt=0;
+
+function voiceStatusText(t){voiceStatus.textContent=t;}
+function stopVoice(){
+  voiceReady=false;
+  if(voiceProcessor){voiceProcessor.disconnect();voiceProcessor.onaudioprocess=null;voiceProcessor=null;}
+  if(voiceStream){voiceStream.getTracks().forEach(t=>t.stop());voiceStream=null;}
+  if(voiceWs){const w=voiceWs;voiceWs=null;try{w.close();}catch(e){}}
+  if(voiceCtx){const c=voiceCtx;voiceCtx=null;c.close().catch(()=>{});}
+  playAt=0;
+  voiceBtn.textContent='🎙️ Voice';
+  voiceBtn.disabled=false;
+  voiceStatusText('Voice chat: off');
+}
+
+function audioToBase64(samples){
+  const pcm=new Int16Array(samples.length);
+  for(let i=0;i<samples.length;i++){
+    const v=Math.max(-1,Math.min(1,samples[i]));
+    pcm[i]=v<0?v*32768:v*32767;
+  }
+  const bytes=new Uint8Array(pcm.buffer);
+  let binary='';
+  for(let i=0;i<bytes.length;i+=8192){
+    binary+=String.fromCharCode(...bytes.subarray(i,Math.min(i+8192,bytes.length)));
+  }
+  return btoa(binary);
+}
+
+function resampleAudio(input,fromRate,toRate){
+  if(fromRate===toRate)return input;
+  const length=Math.floor(input.length*toRate/fromRate);
+  const output=new Float32Array(length);
+  const ratio=fromRate/toRate;
+  for(let i=0;i<length;i++){
+    const start=Math.floor(i*ratio);
+    const end=Math.min(Math.floor((i+1)*ratio),input.length);
+    let sum=0,count=0;
+    for(let j=start;j<end;j++){sum+=input[j];count++;}
+    output[i]=count?sum/count:input[Math.min(start,input.length-1)]||0;
+  }
+  return output;
+}
+
+function playLiveAudio(base64){
+  if(!voiceCtx)return;
+  const raw=atob(base64),samples=new Int16Array(Math.floor(raw.length/2));
+  for(let i=0;i<samples.length;i++){
+    const lo=raw.charCodeAt(i*2),hi=raw.charCodeAt(i*2+1);
+    let n=(hi<<8)|lo;if(n>=32768)n-=65536;
+    samples[i]=n/32768;
+  }
+  const buffer=voiceCtx.createBuffer(1,samples.length,24000);
+  buffer.copyToChannel(Float32Array.from(samples),0);
+  const source=voiceCtx.createBufferSource();
+  source.buffer=buffer;source.connect(voiceCtx.destination);
+  const start=Math.max(voiceCtx.currentTime+0.04,playAt);
+  source.start(start);playAt=start+buffer.duration;
+}
+
+async function startVoice(){
+  voiceBtn.disabled=true;
+  voiceStatusText('Connecting to StudyBot Live…');
+  try{
+    const tokenResponse=await fetch('/live-token',{method:'POST'});
+    const tokenData=await tokenResponse.json();
+    if(!tokenResponse.ok||!tokenData.token)throw new Error(tokenData.error||'Gemini Live token nahi mila.');
+
+    voiceStream=await navigator.mediaDevices.getUserMedia({
+      audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true}
+    });
+    voiceCtx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:24000});
+    await voiceCtx.resume();
+
+    const wsUrl='wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained?access_token='+encodeURIComponent(tokenData.token);
+    voiceWs=new WebSocket(wsUrl);
+
+    voiceWs.onopen=()=>{
+      voiceWs.send(JSON.stringify({setup:{
+        model:'models/'+tokenData.model,
+        generationConfig:{responseModalities:['AUDIO']}
+      }}));
+    };
+
+    voiceWs.onmessage=async(event)=>{
+      let data;
+      try{data=JSON.parse(event.data);}catch(e){return;}
+      if(data.error){
+        voiceStatusText('Live API error: '+(data.error.message||'Unknown error'));
+        stopVoice();return;
+      }
+      if(data.setupComplete){
+        voiceReady=true;
+        voiceBtn.disabled=false;
+        voiceBtn.textContent='⏹ Stop voice';
+        voiceStatusText('Listening… Bolo, StudyBot sun raha hai.');
+        const source=voiceCtx.createMediaStreamSource(voiceStream);
+        voiceProcessor=voiceCtx.createScriptProcessor(4096,1,1);
+        const silent=voiceCtx.createGain();silent.gain.value=0;
+        voiceProcessor.onaudioprocess=(e)=>{
+          if(!voiceReady||!voiceWs||voiceWs.readyState!==WebSocket.OPEN)return;
+          const input=e.inputBuffer.getChannelData(0);
+          const pcm=resampleAudio(input,voiceCtx.sampleRate,16000);
+          voiceWs.send(JSON.stringify({realtimeInput:{audio:{
+            mimeType:'audio/pcm;rate=16000',data:audioToBase64(pcm)
+          }}}));
+        };
+        source.connect(voiceProcessor);voiceProcessor.connect(silent);silent.connect(voiceCtx.destination);
+      }
+      const parts=data.serverContent&&data.serverContent.modelTurn&&data.serverContent.modelTurn.parts;
+      if(parts)for(const part of parts){
+        if(part.inlineData&&part.inlineData.data)playLiveAudio(part.inlineData.data);
+      }
+      if(data.serverContent&&data.serverContent.interrupted)playAt=0;
+    };
+
+    voiceWs.onerror=()=>{voiceStatusText('Voice connection error. API access aur quota check karo.');};
+    voiceWs.onclose=()=>{
+      if(voiceReady){stopVoice();voiceStatusText('Voice connection closed. Dobara try karo.');}
+    };
+  }catch(e){
+    stopVoice();
+    voiceStatusText('Voice start nahi hua: '+(e.message||'Permission ya API error'));
+  }
+  if(!voiceReady)voiceBtn.disabled=false;
+}
+
+voiceBtn.addEventListener('click',()=>{
+  if(voiceWs||voiceStream){stopVoice();return;}
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
+    voiceStatusText('Mic ke liye HTTPS website aur supported browser chahiye.');return;
+  }
+  startVoice();
+});
+
 })();
 </script>
 
@@ -144,6 +282,53 @@ def chat():
                 time.sleep(2 ** attempt)
     print("Gemini request failed after retries; last HTTP code:", last_code)
     return jsonify(reply="AI server abhi busy hai. Kuch seconds baad dobara try karo."), 502
+
+
+@app.route("/live-token", methods=["POST"])
+def live_token():
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        return jsonify(error="Server API key is not configured."), 500
+
+    now = datetime.now(timezone.utc)
+    iso = lambda value: value.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    payload = {
+        "uses": 1,
+        "expireTime": iso(now + timedelta(minutes=30)),
+        "newSessionExpireTime": iso(now + timedelta(minutes=1)),
+        "liveConnectConstraints": {
+            "model": "models/gemini-3.8-live",
+            "config": {
+                "sessionResumption": {},
+                "responseModalities": ["AUDIO"]
+            }
+        }
+    }
+
+    req = urllib.request.Request(
+        "https://generativelanguage.googleapis.com/v1beta/auth_tokens",
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": key
+        },
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            result = json.loads(response.read().decode())
+        token = result.get("name")
+        if not token:
+            return jsonify(error="No token returned by Gemini."), 502
+        return jsonify(token=token, model="gemini-3.8-live")
+    except urllib.error.HTTPError as e:
+        print("Gemini Live token error:", e.code, e.read().decode(errors="replace")[:1000])
+        return jsonify(error=f"Live API token creation failed ({e.code}). Check server logs and model access."), 502
+    except Exception as e:
+        print("Gemini Live connection error:", repr(e))
+        return jsonify(error="Could not connect to Gemini Live API."), 502
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000)
